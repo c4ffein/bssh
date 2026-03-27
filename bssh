@@ -1,0 +1,304 @@
+#!/bin/sh
+# bssh - Persistent SSH sessions using screen
+# Sessions survive connection drops and can be resumed
+
+set -e
+
+SESSIONS_FILE="${HOME}/.bssh_sessions"
+LOCK_DIR="${SESSIONS_FILE}.lock"
+SESSION_PREFIX="bssh"
+
+# Screen escape key: Ctrl-T instead of default Ctrl-A
+SCREEN_ESCAPE="^Tt"
+
+# SSH options for faster disconnect detection
+# ServerAliveInterval: send keepalive every N seconds
+# ServerAliveCountMax: disconnect after N failed keepalives
+# Result: dead connection detected in ~6 seconds (3 * 2)
+SSH_OPTS="-o ServerAliveInterval=3 -o ServerAliveCountMax=2"
+
+# Atomic file locking using mkdir (POSIX-guaranteed atomic)
+lock() {
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        if [ -f "$LOCK_DIR/pid" ]; then
+            pid=$(cat "$LOCK_DIR/pid")
+            if ! kill -0 "$pid" 2>/dev/null; then
+                rm -rf "$LOCK_DIR"
+                continue
+            fi
+        fi
+        sleep 0.1
+    done
+    echo $$ > "$LOCK_DIR/pid"
+}
+
+unlock() {
+    rm -rf "$LOCK_DIR"
+}
+
+# Clean up lock on exit
+trap 'unlock 2>/dev/null; exit' INT TERM EXIT
+
+usage() {
+    echo "Usage: bssh [options] [user@]hostname"
+    echo ""
+    echo "Options:"
+    echo "  -l          List saved sessions"
+    echo "  -c          Clean stale sessions from local file"
+    echo "  -n NAME     Use specific session name instead of auto-generated"
+    echo "  -h          Show this help"
+    echo ""
+    echo "Sessions are automatically saved and can be resumed on reconnect."
+}
+
+# Ensure sessions file exists
+touch "$SESSIONS_FILE" 2>/dev/null || true
+
+# Generate session name from timestamp
+generate_session_name() {
+    echo "${SESSION_PREFIX}_$(date +%Y%m%d_%H%M%S)"
+}
+
+# Get sessions for a specific host from local file
+get_local_sessions() {
+    host="$1"
+    grep "^${host}:" "$SESSIONS_FILE" 2>/dev/null | cut -d: -f2 || true
+}
+
+# Add session to local file (locked, atomic)
+add_session() {
+    lock
+    echo "${1}:${2}" >> "$SESSIONS_FILE"
+    unlock
+}
+
+# Remove session from local file (locked, atomic via tmp+mv)
+remove_session() {
+    lock
+    tmp=$(mktemp)
+    grep -v "^${1}:${2}$" "$SESSIONS_FILE" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$SESSIONS_FILE"
+    unlock
+}
+
+# Check if session exists on remote host, returns list of valid sessions
+check_remote_sessions() {
+    host="$1"
+    shift
+    sessions="$*"
+
+    if [ -z "$sessions" ]; then
+        return
+    fi
+
+    # Build a script to check which sessions exist
+    check_script="screen -ls 2>/dev/null | grep -E '\\.(${SESSION_PREFIX}_[0-9_]+)\\s' | sed 's/.*\\.\\(${SESSION_PREFIX}_[0-9_]*\\).*/\\1/' || true"
+
+    ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS "$host" "$check_script" 2>/dev/null || true
+}
+
+# List all saved sessions
+list_sessions() {
+    if [ ! -s "$SESSIONS_FILE" ]; then
+        echo "No saved sessions."
+        return
+    fi
+    echo "Saved sessions:"
+    echo ""
+    sort "$SESSIONS_FILE" | while IFS=: read -r host session; do
+        echo "  $host -> $session"
+    done
+}
+
+# Clean stale sessions (check all hosts)
+clean_sessions() {
+    if [ ! -s "$SESSIONS_FILE" ]; then
+        echo "No sessions to clean."
+        return
+    fi
+
+    echo "Checking sessions..."
+
+    # Get unique hosts
+    hosts=$(cut -d: -f1 "$SESSIONS_FILE" | sort -u)
+
+    for host in $hosts; do
+        echo "Checking $host..."
+        local_sessions=$(get_local_sessions "$host")
+        remote_sessions=$(check_remote_sessions "$host" $local_sessions)
+
+        for session in $local_sessions; do
+            if ! echo "$remote_sessions" | grep -q "^${session}$"; then
+                echo "  Removing stale: $session"
+                remove_session "$host" "$session"
+            else
+                echo "  Valid: $session"
+            fi
+        done
+    done
+
+    echo "Done."
+}
+
+# Main connection logic
+connect() {
+    host="$1"
+    forced_session="$2"
+
+    echo "Connecting to $host..."
+
+    # Get locally tracked sessions for this host
+    local_sessions=$(get_local_sessions "$host")
+
+    valid_sessions=""
+    if [ -n "$local_sessions" ]; then
+        echo "Checking existing sessions..."
+        valid_sessions=$(check_remote_sessions "$host" $local_sessions)
+
+        # Clean up stale sessions from local file
+        for session in $local_sessions; do
+            if ! echo "$valid_sessions" | grep -q "^${session}$"; then
+                echo "  Removed stale session: $session"
+                remove_session "$host" "$session"
+            fi
+        done
+    fi
+
+    # If user specified a session name, use it
+    if [ -n "$forced_session" ]; then
+        session_name="$forced_session"
+        if echo "$valid_sessions" | grep -q "^${session_name}$"; then
+            echo "Reattaching to: $session_name"
+            ssh -t $SSH_OPTS "$host" "screen -e '$SCREEN_ESCAPE' -d -r '$session_name' || screen -e '$SCREEN_ESCAPE' -S '$session_name'"
+        else
+            echo "Creating new session: $session_name"
+            add_session "$host" "$session_name"
+            ssh -t $SSH_OPTS "$host" "screen -e '$SCREEN_ESCAPE' -S '$session_name'"
+        fi
+        return
+    fi
+
+    # Count valid sessions
+    session_count=0
+    if [ -n "$valid_sessions" ]; then
+        session_count=$(echo "$valid_sessions" | grep -c . || true)
+    fi
+
+    if [ "$session_count" -eq 0 ]; then
+        # No existing sessions, create new one
+        session_name=$(generate_session_name)
+        echo "Creating new session: $session_name"
+        add_session "$host" "$session_name"
+        ssh -t $SSH_OPTS "$host" "screen -e '$SCREEN_ESCAPE' -S '$session_name'"
+
+    elif [ "$session_count" -eq 1 ]; then
+        # One session, ask to reattach or create new
+        session_name=$(echo "$valid_sessions" | head -1)
+        echo ""
+        echo "Found existing session: $session_name"
+        echo ""
+        printf "  [r] Reattach to existing session\n"
+        printf "  [n] Create new session\n"
+        printf "  [q] Quit\n"
+        echo ""
+        printf "Choice [r]: "
+        read -r choice
+
+        case "$choice" in
+            n|N)
+                session_name=$(generate_session_name)
+                echo "Creating new session: $session_name"
+                add_session "$host" "$session_name"
+                ssh -t $SSH_OPTS "$host" "screen -e '$SCREEN_ESCAPE' -S '$session_name'"
+                ;;
+            q|Q)
+                echo "Aborted."
+                exit 0
+                ;;
+            *)
+                echo "Reattaching to: $session_name"
+                ssh -t $SSH_OPTS "$host" "screen -e '$SCREEN_ESCAPE' -d -r '$session_name' || screen -e '$SCREEN_ESCAPE' -S '$session_name'"
+                ;;
+        esac
+
+    else
+        # Multiple sessions, let user choose
+        echo ""
+        echo "Found existing sessions:"
+        echo ""
+        i=1
+        for session in $valid_sessions; do
+            printf "  [%d] %s\n" "$i" "$session"
+            i=$((i + 1))
+        done
+        printf "  [n] Create new session\n"
+        printf "  [q] Quit\n"
+        echo ""
+        printf "Choice [1]: "
+        read -r choice
+
+        case "$choice" in
+            n|N)
+                session_name=$(generate_session_name)
+                echo "Creating new session: $session_name"
+                add_session "$host" "$session_name"
+                ssh -t $SSH_OPTS "$host" "screen -e '$SCREEN_ESCAPE' -S '$session_name'"
+                ;;
+            q|Q)
+                echo "Aborted."
+                exit 0
+                ;;
+            ''|1)
+                session_name=$(echo "$valid_sessions" | sed -n '1p')
+                echo "Reattaching to: $session_name"
+                ssh -t $SSH_OPTS "$host" "screen -e '$SCREEN_ESCAPE' -d -r '$session_name' || screen -e '$SCREEN_ESCAPE' -S '$session_name'"
+                ;;
+            *)
+                if [ "$choice" -gt 0 ] 2>/dev/null && [ "$choice" -le "$session_count" ]; then
+                    session_name=$(echo "$valid_sessions" | sed -n "${choice}p")
+                    echo "Reattaching to: $session_name"
+                    ssh -t $SSH_OPTS "$host" "screen -e '$SCREEN_ESCAPE' -d -r '$session_name' || screen -e '$SCREEN_ESCAPE' -S '$session_name'"
+                else
+                    echo "Invalid choice."
+                    exit 1
+                fi
+                ;;
+        esac
+    fi
+}
+
+# Parse arguments
+session_name=""
+while getopts "lcn:h" opt; do
+    case "$opt" in
+        l)
+            list_sessions
+            exit 0
+            ;;
+        c)
+            clean_sessions
+            exit 0
+            ;;
+        n)
+            session_name="$OPTARG"
+            ;;
+        h)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# Need a hostname
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+
+host="$1"
+connect "$host" "$session_name"
